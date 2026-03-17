@@ -5,81 +5,57 @@ from datetime import datetime
 import yfinance as yf
 from groq import Groq
 
-# ========================= CONFIG =========================
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ====================== CONFIG CHECK ======================
 print("🔧 Configuration Check:")
-if not TELEGRAM_BOT_TOKEN:
-    print("❌ TELEGRAM_BOT_TOKEN is MISSING")
-if not TELEGRAM_CHAT_ID:
-    print("❌ TELEGRAM_CHAT_ID is MISSING")
-if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-    print(f"✅ Secrets found → Will send to chat ID: {TELEGRAM_CHAT_ID}")
-print("=" * 70)
+print(f"TELEGRAM_BOT_TOKEN: {'✅ Present' if TELEGRAM_BOT_TOKEN else '❌ MISSING'}")
+print(f"TELEGRAM_CHAT_ID:   {'✅ Present' if TELEGRAM_CHAT_ID else '❌ MISSING'}")
+print(f"GROQ_API_KEY:       {'✅ Present' if groq_client.api_key else '❌ MISSING'}")
+print("=" * 80)
 
-# Suppress yfinance warnings
-yf.pdr_override = lambda *args, **kwargs: None
-
-RSS_FEEDS = [
-    "https://news.google.com/rss/search?q=india+stock+market+OR+defence+stocks+OR+broker+upgrade+OR+downgrade+OR+HAL+BEL+BDL",
-    "https://news.google.com/rss/search?q=defence+india+stocks+OR+order+win+HAL+BEL+Mazagon",
-    "https://www.moneycontrol.com/news/rss/latestnews.xml",
-    "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms",
-]
-
+# ====================== FETCH & ANALYZE ======================
 def fetch_all_news():
     articles = []
     seen = set()
     import feedparser
-    for url in RSS_FEEDS:
+    feeds = [
+        "https://news.google.com/rss/search?q=defence+india+stocks+OR+HAL+BEL+BDL+order+win",
+        "https://news.google.com/rss/search?q=broker+upgrade+OR+downgrade+india+stocks",
+    ]
+    for url in feeds:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:12]:
+            for entry in feed.entries[:10]:
                 title = entry.title.strip()
-                summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
-                key = (title + summary)[:100].lower()
-                if key in seen: continue
-                seen.add(key)
-                articles.append({"title": title, "summary": summary})
+                if title in seen: continue
+                seen.add(title)
+                articles.append({"title": title, "summary": getattr(entry, 'summary', '')})
         except:
             pass
     return articles
 
-def clean_ticker(ticker: str):
-    if not ticker: return None
-    t = re.sub(r'[^A-Z0-9]', '', ticker.upper().strip())
-    if len(t) < 3 or t in ['NIFTY', 'SENSEX', 'CRUDEOIL', 'GOLD', 'BANKNIFTY']:
-        return None
-    return t
+def clean_ticker(t: str):
+    if not t: return None
+    t = re.sub(r'[^A-Z0-9]', '', t.upper())
+    return t if len(t) >= 3 and t not in ['NIFTY','SENSEX','CRUDEOIL'] else None
 
-def get_current_price(ticker: str):
-    if not ticker: return None
+def get_price(ticker):
     try:
-        data = yf.Ticker(f"{ticker}.NS").fast_info
-        price = data.get('lastPrice') or data.get('regularMarketPrice')
-        return round(float(price), 2) if price else None
+        p = yf.Ticker(f"{ticker}.NS").fast_info.get('lastPrice')
+        return round(float(p), 2) if p else None
     except:
         return None
 
-def analyze_news(text: str):
-    prompt = f"""You are an elite Indian equity analyst focused on defence and momentum stocks.
-Return ONLY valid JSON.
-
-News: {text}
-
-JSON format:
-{{"stocks": ["HAL", "BEL"], "sentiment": "positive", "sector": "defence", "event": "upgrade", "confidence": 80, "reason": "short powerful reason"}}
-"""
+def analyze_news(text):
     try:
         resp = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.1-8b-instant",   # Much cheaper & higher limits
+            messages=[{"role": "user", "content": f"""Return ONLY JSON.\nNews: {text}\nJSON: {{"stocks": ["HAL"], "confidence": 80, "reason": "short reason"}}"""}],
             temperature=0.1,
-            max_tokens=700
+            max_tokens=300
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
@@ -87,102 +63,60 @@ JSON format:
         return None
 
 def safe_json(text):
-    if not text: return None
-    try: return json.loads(text)
+    try:
+        return json.loads(text)
     except:
         match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            try: return json.loads(match.group())
-            except: pass
-    return None
+        return json.loads(match.group()) if match else None
 
 # ====================== MAIN ======================
 def main():
-    print("🚀 Starting AI Stock Signal Scanner...\n")
     articles = fetch_all_news()
     results = []
     price_cache = {}
 
     for article in articles:
-        text = article["title"] + " " + article.get("summary", "")
-        print(f"📰 {article['title'][:90]}...")
-
-        raw = analyze_news(text)
+        raw = analyze_news(article["title"] + " " + article.get("summary", ""))
         data = safe_json(raw)
-        if not data or not data.get("stocks"):
-            continue
+        if not data or not data.get("stocks"): continue
 
-        clean_stocks = [clean_ticker(t) for t in data.get("stocks", []) if clean_ticker(t)]
-        if not clean_stocks: continue
+        ticker = clean_ticker(data["stocks"][0])
+        if not ticker: continue
 
-        ticker = clean_stocks[0]
         if ticker not in price_cache:
-            price_cache[ticker] = get_current_price(ticker)
+            price_cache[ticker] = get_price(ticker)
 
         price = price_cache[ticker]
         conf = int(data.get("confidence", 60))
-
-        signal = "🚀 STRONG BUY" if conf >= 80 else "📈 BUY" if conf >= 60 else "HOLD"
-        if signal == "HOLD": continue
+        signal = "🚀 STRONG BUY" if conf >= 75 else "📈 BUY"
 
         entry = price if price else "Market Price"
         target = round(price * 1.18, 2) if price else None
-        stop = round(price * 0.92, 2) if price else None
 
-        results.append({
-            "ticker": ticker,
-            "signal": signal,
-            "entry": entry,
-            "target": target,
-            "stop": stop,
-            "reason": data.get("reason", "Strong momentum"),
-            "confidence": conf
-        })
+        results.append({"ticker": ticker, "signal": signal, "entry": entry, "target": target, "reason": data.get("reason", "")})
 
-    # ====================== BUILD MESSAGE ======================
-    now = datetime.now().strftime('%d %b %H:%M')
-    msg = f"🧠 **AI Stock Signals** — {now}\n\n"
-    msg += "**High Conviction Calls**\n\n"
-
-    seen = {}
-    for r in sorted(results, key=lambda x: x["confidence"], reverse=True):
-        if r["ticker"] not in seen:
-            seen[r["ticker"]] = r
-
-    for r in list(seen.values())[:8]:
-        target_str = f"₹{r['target']}" if r['target'] else "N/A"
-        stop_str = f"₹{r['stop']}" if r['stop'] else "N/A"
+    # Build Message
+    msg = f"🧠 **AI Defence Signals** — {datetime.now().strftime('%d %b %H:%M')}\n\n"
+    for r in sorted(results, key=lambda x: x.get("confidence",0), reverse=True)[:8]:
         msg += f"**{r['ticker']}** — {r['signal']}\n"
-        msg += f"Entry ≈ ₹{r['entry']} | Target {target_str} | Stop {stop_str}\n"
+        msg += f"Entry ≈ ₹{r['entry']} | Target ₹{r.get('target','N/A')}\n"
         msg += f"→ {r['reason']}\n\n"
 
-    if not seen:
-        msg += "No strong signals this run.\n"
+    msg += "⚡ Powered by Groq"
 
-    msg += "⚡ Powered by Groq • Live NSE prices • Defence Focus"
-
-    print("\n" + "="*80)
     print(msg)
-    print("="*80)
 
-    # ====================== SEND TO TELEGRAM ======================
+    # Send to Telegram
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         import requests
         try:
-            response = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
-                timeout=10
-            )
-            if response.status_code == 200:
-                print("✅ Successfully sent to your bot chat!")
-            else:
-                print(f"❌ Telegram API Error: {response.status_code}")
-                print(response.text)
+            r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                              json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+            print("✅ Sent to Telegram" if r.status_code == 200 else f"❌ Telegram Error {r.status_code}")
         except Exception as e:
-            print(f"❌ Failed to send to Telegram: {e}")
+            print(f"❌ Telegram failed: {e}")
     else:
-        print("⚠️ Cannot send - TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing in secrets")
+        print("⚠️ Telegram secrets still missing")
 
 if __name__ == "__main__":
     main()
