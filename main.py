@@ -11,15 +11,16 @@ from groq import Groq
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+NEWSDATA_API_KEY = os.getenv("NEWSDATA_API_KEY")
+MARKETAUX_API_KEY = os.getenv("MARKETAUX_API_KEY")
 
 SEEN_FILE = "seen.json"
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-print("🔧 Configuration Check:")
-print(f"GROQ_API_KEY:       {'✅ Present' if GROQ_API_KEY else '❌ MISSING'}")
-print(f"TELEGRAM_BOT_TOKEN: {'✅ Present' if TELEGRAM_BOT_TOKEN else '❌ MISSING'}")
-print(f"TELEGRAM_CHAT_ID:   {'✅ Present' if TELEGRAM_CHAT_ID else '❌ MISSING'}")
+print("🔧 Config Check:")
+print(f"GROQ: {'✅' if GROQ_API_KEY else '❌'} | TG: {'✅' if TELEGRAM_BOT_TOKEN else '❌'} | Chat: {'✅' if TELEGRAM_CHAT_ID else '❌'}")
+print(f"NewsData: {'✅' if NEWSDATA_API_KEY else '❌'} | MarketAux: {'✅' if MARKETAUX_API_KEY else '❌'}")
 print("=" * 60)
 
 # ====================== STORAGE ======================
@@ -34,59 +35,122 @@ def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
         json.dump(list(seen), f)
 
-# ====================== FETCH NEWS ======================
-def fetch_all_news():
-    articles = []
-    seen_titles = set()
-
+# ====================== RSS ======================
+def fetch_rss_news():
     feeds = [
-        "https://news.google.com/rss/search?q=defence+india+stocks+HAL+BEL+BDL+order",
-        "https://news.google.com/rss/search?q=broker+upgrade+downgrade+india+stocks",
+        "https://news.google.com/rss/search?q=indian+stocks+market",
+        "https://news.google.com/rss/search?q=NSE+BSE+stocks",
+        "https://news.google.com/rss/search?q=broker+upgrade+downgrade+india",
+        "https://news.google.com/rss/search?q=india+business+breaking+stocks",
     ]
+
+    articles, seen = [], set()
 
     for url in feeds:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:10]:
-                title = entry.title.strip()
-                if title in seen_titles:
+            for e in feed.entries[:6]:
+                title = e.title.strip()
+                if title in seen:
                     continue
-                seen_titles.add(title)
+                seen.add(title)
 
                 articles.append({
                     "title": title,
-                    "summary": getattr(entry, "summary", "")
+                    "summary": getattr(e, "summary", "")
                 })
         except Exception as e:
-            print(f"Feed error: {e}")
+            print(f"RSS error: {e}")
 
+    print(f"📰 RSS: {len(articles)}")
     return articles
+
+# ====================== NEWSDATA ======================
+def fetch_newsdata():
+    if not NEWSDATA_API_KEY:
+        return []
+
+    url = "https://newsdata.io/api/1/news"
+    params = {
+        "apikey": NEWSDATA_API_KEY,
+        "q": "india stock market OR NSE OR BSE",
+        "country": "in",
+        "language": "en",
+        "category": "business",
+    }
+
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        data = res.json()
+
+        articles = [{
+            "title": i.get("title", "").strip(),
+            "summary": i.get("description", "").strip()
+        } for i in data.get("results", []) if i.get("title")]
+
+        print(f"🛰️ NewsData: {len(articles)}")
+        return articles
+
+    except Exception as e:
+        print(f"NewsData error: {e}")
+        return []
+
+# ====================== MARKETAUX ======================
+def fetch_marketaux():
+    if not MARKETAUX_API_KEY:
+        return []
+
+    url = "https://api.marketaux.com/v1/news/all"
+    params = {
+        "api_token": MARKETAUX_API_KEY,
+        "countries": "in",
+        "language": "en",
+        "limit": 20,
+    }
+
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        data = res.json()
+
+        articles = []
+        for i in data.get("data", []):
+            tickers = [
+                ent.get("symbol", "").replace(".NS", "").replace(".BO", "")
+                for ent in i.get("entities", [])
+                if ent.get("symbol")
+            ]
+
+            articles.append({
+                "title": i.get("title", "").strip(),
+                "summary": i.get("description", "").strip(),
+                "tickers": tickers
+            })
+
+        print(f"📊 MarketAux: {len(articles)}")
+        return articles
+
+    except Exception as e:
+        print(f"MarketAux error: {e}")
+        return []
 
 # ====================== HELPERS ======================
 def clean_ticker(t):
     if not t:
         return None
     t = re.sub(r'[^A-Z0-9]', '', t.upper())
-    if len(t) < 3 or t in ["NIFTY", "SENSEX", "CRUDEOIL"]:
-        return None
-    return t
+    return t if len(t) >= 3 else None
 
-def get_price_and_volume(ticker):
+def get_price_volume(ticker):
     try:
-        stock = yf.Ticker(f"{ticker}.NS")
-        info = stock.fast_info
-        price = info.get("lastPrice")
+        s = yf.Ticker(f"{ticker}.NS")
+        price = s.fast_info.get("lastPrice")
 
-        hist = stock.history(period="5d")
+        hist = s.history(period="5d")
         if hist.empty:
             return None, False
 
-        avg_vol = hist["Volume"].mean()
-        latest_vol = hist["Volume"].iloc[-1]
+        return round(price, 2), hist["Volume"].iloc[-1] > hist["Volume"].mean()
 
-        volume_spike = latest_vol > avg_vol
-
-        return round(float(price), 2) if price else None, volume_spike
     except:
         return None, False
 
@@ -100,96 +164,106 @@ News: {text}
 
 Format:
 {{
-  "stocks": ["HAL"],
-  "confidence": 0-100,
-  "reason": "max 12 words, specific catalyst"
+ "stocks": ["RELIANCE"],
+ "confidence": 0-100,
+ "reason": "max 12 words, specific catalyst"
 }}
 """
-        resp = groq_client.chat.completions.create(
+        r = groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=200
+            max_tokens=150
         )
 
-        return resp.choices[0].message.content.strip()
+        return r.choices[0].message.content.strip()
 
     except Exception as e:
-        print(f"Groq Error: {e}")
+        print(f"Groq error: {e}")
         return None
 
-def safe_json(text):
-    if not text:
-        return None
+def safe_json(t):
     try:
-        return json.loads(text)
+        return json.loads(t)
     except:
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except:
-                return None
-    return None
+        m = re.search(r'\{.*\}', t or "", re.DOTALL)
+        return json.loads(m.group()) if m else None
 
 # ====================== MAIN ======================
 def main():
     seen = load_seen()
-    articles = fetch_all_news()
 
-    results = []
-    price_cache = {}
+    # Fetch all sources
+    articles = (
+        fetch_rss_news() +
+        fetch_newsdata() +
+        fetch_marketaux()
+    )
 
-    for article in articles:
-        raw = analyze_news(article["title"] + " " + article["summary"])
-        data = safe_json(raw)
+    # Deduplicate
+    unique = {}
+    for a in articles:
+        key = a["title"].lower()
+        if key not in unique:
+            unique[key] = a
 
-        if not data or not data.get("stocks"):
+    articles = list(unique.values())
+    print(f"🧠 Total: {len(articles)}")
+
+    results, price_cache = [], {}
+
+    for a in articles:
+        text_blob = (a["title"] + " " + a.get("summary", "")).lower()
+
+        if not any(k in text_blob for k in ["stock", "nse", "bse", "shares", "earnings", "order"]):
             continue
 
-        ticker = clean_ticker(data["stocks"][0])
-        if not ticker:
+        ticker, conf, reason = None, 50, ""
+
+        # Prefer MarketAux ticker
+        if a.get("tickers"):
+            ticker = clean_ticker(a["tickers"][0])
+            raw = analyze_news(a["title"])
+            data = safe_json(raw)
+            if data:
+                conf = int(data.get("confidence", 70)) + 10
+                reason = data.get("reason", "")
+        else:
+            raw = analyze_news(a["title"] + " " + a.get("summary", ""))
+            data = safe_json(raw)
+            if not data or not data.get("stocks"):
+                continue
+
+            ticker = clean_ticker(data["stocks"][0])
+            conf = int(data.get("confidence", 50))
+            reason = data.get("reason", "")
+
+        if not ticker or conf < 65:
             continue
 
-        key = f"{ticker}_{article['title']}"
+        key = f"{ticker}_{a['title']}"
         if key in seen:
             continue
 
-        conf = int(data.get("confidence", 50))
-
-        # Filter weak signals
-        if conf < 65:
-            continue
-
         if ticker not in price_cache:
-            price, volume_spike = get_price_and_volume(ticker)
-            price_cache[ticker] = (price, volume_spike)
+            price_cache[ticker] = get_price_volume(ticker)
 
-        price, volume_spike = price_cache[ticker]
-
-        # Skip if no volume support
-        if not volume_spike:
+        price, vol_ok = price_cache[ticker]
+        if not vol_ok:
             continue
 
-        entry = price if price else "Market"
+        entry = price or "Market"
         target = round(price * 1.18, 2) if price else "N/A"
 
-        if conf >= 85:
-            signal = "🚀 Momentum Build-up"
-            risk = "Low"
-        elif conf >= 75:
-            signal = "📈 Early Accumulation"
-            risk = "Medium"
-        else:
-            signal = "⚡ Breakout Watch"
-            risk = "High"
+        signal = "🚀 Momentum" if conf >= 85 else "📈 Accumulation" if conf >= 75 else "⚡ Watch"
+        risk = "Low" if conf >= 85 else "Medium" if conf >= 75 else "High"
 
         results.append({
             "ticker": ticker,
             "signal": signal,
             "entry": entry,
             "target": target,
-            "reason": data.get("reason", ""),
+            "reason": reason,
             "confidence": conf,
             "risk": risk
         })
@@ -198,46 +272,30 @@ def main():
 
     save_seen(seen)
 
-    # ====================== MESSAGE ======================
     if not results:
-        print("No strong signals found.")
+        print("No signals.")
         return
-
-    msg = f"🧠 AI Stock Signals — {datetime.now().strftime('%d %b %H:%M')}\n\n"
 
     results = sorted(results, key=lambda x: x["confidence"], reverse=True)[:8]
 
+    msg = f"🧠 AI Stock Signals — {datetime.now().strftime('%d %b %H:%M')}\n\n"
+
     for r in results:
         msg += f"**{r['ticker']}** — {r['signal']}\n"
-        msg += f"Entry ≈ ₹{r['entry']} | Target ₹{r['target']}\n"
-        msg += f"Risk: {r['risk']}\n"
+        msg += f"₹{r['entry']} → ₹{r['target']} | Risk: {r['risk']}\n"
         msg += f"→ {r['reason']}\n\n"
-
-    msg += "⚡ Powered by AI"
 
     print(msg)
 
-    # ====================== TELEGRAM ======================
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
-            response = requests.post(
+            res = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": msg,
-                    "parse_mode": "Markdown"
-                }
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
             )
-
-            if response.status_code == 200:
-                print("✅ Sent to Telegram")
-            else:
-                print(f"❌ Telegram Error: {response.status_code} | {response.text}")
-
+            print("✅ Sent" if res.status_code == 200 else f"❌ {res.text}")
         except Exception as e:
-            print(f"❌ Telegram failed: {e}")
-    else:
-        print("⚠️ Telegram not configured")
+            print(f"Telegram error: {e}")
 
 # ====================== RUN ======================
 if __name__ == "__main__":
