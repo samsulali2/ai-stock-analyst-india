@@ -1,5 +1,4 @@
 groq
 feedparser
 yfinance
-python-dotenv
-requests
+cerebras_cloud_sdk
