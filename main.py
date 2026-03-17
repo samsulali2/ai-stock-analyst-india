@@ -3,36 +3,20 @@ import json
 import re
 import time
 from datetime import datetime
-from collections import defaultdict
-from groq import Groq
 import yfinance as yf
 import logging
+from groq import Groq
 
 # ========================= CONFIG =========================
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
-
-if not GROQ_API_KEY:
-    raise ValueError("❌ GROQ_API_KEY is missing!")
-
-groq_client = Groq(api_key=GROQ_API_KEY)
-
-# Optional Cerebras (only create if key exists)
-cerebras_client = None
-if CEREBRAS_API_KEY:
-    try:
-        from cerebras.cloud.sdk import Cerebras
-        cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
-        print("✅ Cerebras client initialized successfully")
-    except Exception as e:
-        print(f"⚠️ Cerebras import failed: {e} (falling back to Groq only)")
-else:
-    print("⚠️ CEREBRAS_API_KEY not found → Running in Groq-only mode")
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ====================== REST OF THE CODE (same as last stable version) ======================
+# Suppress yfinance spam
+yf.pdr_override = lambda *args, **kwargs: None
+logging.getLogger("yfinance").setLevel(logging.ERROR)
+
 RSS_FEEDS = [
     "https://news.google.com/rss/search?q=india+stock+market+OR+defence+stocks+OR+broker+upgrade+OR+downgrade+OR+HAL+BEL+BDL",
     "https://news.google.com/rss/search?q=defence+india+stocks+OR+order+win+HAL+BEL+Mazagon",
@@ -47,18 +31,27 @@ def fetch_all_news():
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:10]:
+            for entry in feed.entries[:12]:
                 title = entry.title.strip()
                 summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
-                key = title.lower()
+                key = (title + summary)[:100].lower()
                 if key in seen: continue
                 seen.add(key)
                 articles.append({"title": title, "summary": summary})
         except:
             pass
-    return articles[:40]
+    return articles
 
-def get_current_price(ticker):
+def clean_ticker(ticker: str) -> str:
+    if not ticker:
+        return None
+    t = re.sub(r'[^A-Z0-9]', '', ticker.upper().strip())
+    if len(t) < 3 or t in ['NIFTY', 'SENSEX', 'CRUDEOIL', 'GOLD', 'BANKNIFTY']:
+        return None
+    return t
+
+def get_current_price(ticker: str):
+    if not ticker: return None
     try:
         data = yf.Ticker(f"{ticker}.NS").fast_info
         price = data.get('lastPrice') or data.get('regularMarketPrice')
@@ -66,25 +59,24 @@ def get_current_price(ticker):
     except:
         return None
 
-def analyze_news(text: str, use_cerebras=False):
-    prompt = f"""You are an elite Indian stock analyst. Return ONLY valid JSON.
+def analyze_news(text: str):
+    prompt = f"""You are an elite Indian equity analyst. Return ONLY valid JSON.
 
 News: {text}
 
-{{"stocks": ["HAL"], "sentiment": "positive", "sector": "defence", "event": "upgrade", "confidence": 80, "reason": "short reason"}}
+JSON:
+{{"stocks": ["HAL", "BEL"], "sentiment": "positive", "sector": "defence", "event": "upgrade", "confidence": 85, "reason": "short clear reason"}}
 """
     try:
-        if use_cerebras and cerebras_client:
-            resp = cerebras_client.chat.completions.create(
-                model="gpt-oss-120b", messages=[{"role": "user", "content": prompt}], temperature=0.1
-            )
-        else:
-            resp = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}], temperature=0.1
-            )
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=600
+        )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        print(f"AI Error: {e}")
+        print(f"Groq Error: {e}")
         return None
 
 def safe_json(text):
@@ -99,32 +91,38 @@ def safe_json(text):
 
 # ====================== MAIN ======================
 def main():
-    print("🚀 Starting AI Stock Scanner (Groq + optional Cerebras)...\n")
+    print("🚀 Starting Clean Defence Stock Scanner...\n")
     articles = fetch_all_news()
     results = []
     price_cache = {}
 
     for article in articles:
         text = article["title"] + " " + article.get("summary", "")
-        print(f"📰 {article['title'][:90]}...")
+        print(f"📰 {article['title'][:95]}...")
 
-        raw = analyze_news(text, use_cerebras=bool(cerebras_client))
+        raw = analyze_news(text)
         data = safe_json(raw)
         if not data or not data.get("stocks"):
             continue
 
-        ticker = data["stocks"][0]
+        # Clean tickers
+        clean_stocks = [clean_ticker(t) for t in data.get("stocks", []) if clean_ticker(t)]
+        if not clean_stocks: continue
+
+        ticker = clean_stocks[0]
+
         if ticker not in price_cache:
             price_cache[ticker] = get_current_price(ticker)
-        price = price_cache[ticker]
 
+        price = price_cache[ticker]
         conf = int(data.get("confidence", 60))
+
         signal = "🚀 STRONG BUY" if conf >= 80 else "📈 BUY" if conf >= 60 else "HOLD"
         if signal == "HOLD": continue
 
-        entry = price or "Market Price"
-        target = round(price * 1.18, 2) if price else "N/A"
-        stop = round(price * 0.92, 2) if price else "N/A"
+        entry = price if price else "Market Price"
+        target = round(price * 1.18, 2) if price else None
+        stop = round(price * 0.92, 2) if price else None
 
         results.append({
             "ticker": ticker,
@@ -132,39 +130,55 @@ def main():
             "entry": entry,
             "target": target,
             "stop": stop,
-            "reason": data.get("reason", "Strong momentum detected"),
+            "reason": data.get("reason", "Strong momentum"),
             "confidence": conf
         })
 
-    # ====================== CLEAN TELEGRAM MESSAGE ======================
-    print("\n" + "="*85)
-    print("📲 **COPY THIS BLOCK FOR YOUR TELEGRAM CHANNEL** 📲\n")
+    # ====================== TELEGRAM MESSAGE ======================
+    print("\n" + "="*90)
+    print("📲 COPY THIS FOR YOUR TELEGRAM CHANNEL 📲\n")
 
     now = datetime.now().strftime('%d %b %H:%M')
-    msg = f"🧠 **AI Brainstorm Signals** — {now}\n\n"
-    msg += "**High Conviction India Stock Calls**\n\n"
+    msg = f"🧠 **AI Defence & Momentum Signals** — {now}\n\n"
+    msg += "**High Conviction Calls**\n\n"
 
-    for r in sorted(results, key=lambda x: x["confidence"], reverse=True)[:8]:
+    # Remove duplicate tickers, keep highest confidence
+    seen = {}
+    for r in sorted(results, key=lambda x: x["confidence"], reverse=True):
+        if r["ticker"] not in seen:
+            seen[r["ticker"]] = r
+
+    for r in list(seen.values())[:8]:
+        target_str = f"₹{r['target']}" if r['target'] else "N/A"
+        stop_str = f"₹{r['stop']}" if r['stop'] else "N/A"
         msg += f"**{r['ticker']}** — {r['signal']}\n"
-        msg += f"Entry ≈ ₹{r['entry']} | Target ₹{r['target']} | Stop ₹{r['stop']}\n"
+        msg += f"Entry ≈ ₹{r['entry']} | Target {target_str} | Stop {stop_str}\n"
         msg += f"→ {r['reason']}\n\n"
 
-    if not results:
-        msg += "No strong signals detected in latest scan."
+    if not seen:
+        msg += "No strong signals in this scan."
 
-    msg += "\n⚡ Powered by Groq (Cerebras when available) • Live NSE prices"
+    msg += "\n⚡ Powered by Groq • Live NSE prices • Defence focus"
 
     print(msg)
 
-    # Auto-post to Telegram if configured
+    # Auto post to Telegram
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         import requests
         try:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                          json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-            print("✅ Posted successfully to your Telegram channel!")
+            response = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+                timeout=10
+            )
+            if response.status_code == 200:
+                print("✅ Successfully posted to your Telegram channel!")
+            else:
+                print(f"❌ Telegram failed: {response.text}")
         except Exception as e:
-            print("❌ Telegram post failed:", e)
+            print(f"❌ Telegram error: {e}")
+    else:
+        print("⚠️  Telegram not configured (add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets)")
 
 if __name__ == "__main__":
     main()
