@@ -1,0 +1,5 @@
+groq
+feedparser
+yfinance
+python-dotenv
+requests
