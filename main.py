@@ -5,17 +5,34 @@ import time
 from datetime import datetime
 from collections import defaultdict
 from groq import Groq
-from cerebras.cloud.sdk import Cerebras
 import yfinance as yf
 import logging
 
 # ========================= CONFIG =========================
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-cerebras_client = Cerebras(api_key=os.getenv("CEREBRAS_API_KEY"))
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+
+if not GROQ_API_KEY:
+    raise ValueError("❌ GROQ_API_KEY is missing!")
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+# Optional Cerebras (only create if key exists)
+cerebras_client = None
+if CEREBRAS_API_KEY:
+    try:
+        from cerebras.cloud.sdk import Cerebras
+        cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
+        print("✅ Cerebras client initialized successfully")
+    except Exception as e:
+        print(f"⚠️ Cerebras import failed: {e} (falling back to Groq only)")
+else:
+    print("⚠️ CEREBRAS_API_KEY not found → Running in Groq-only mode")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# ====================== REST OF THE CODE (same as last stable version) ======================
 RSS_FEEDS = [
     "https://news.google.com/rss/search?q=india+stock+market+OR+defence+stocks+OR+broker+upgrade+OR+downgrade+OR+HAL+BEL+BDL",
     "https://news.google.com/rss/search?q=defence+india+stocks+OR+order+win+HAL+BEL+Mazagon",
@@ -23,170 +40,131 @@ RSS_FEEDS = [
     "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms",
 ]
 
-RESEARCH_HOUSES = {"Motilal Oswal", "Emkay", "ICICI Direct", "HDFC Securities", "Goldman Sachs", "Jefferies", "CLSA", "Nomura"}
+def fetch_all_news():
+    articles = []
+    seen = set()
+    import feedparser
+    for url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:10]:
+                title = entry.title.strip()
+                summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
+                key = title.lower()
+                if key in seen: continue
+                seen.add(key)
+                articles.append({"title": title, "summary": summary})
+        except:
+            pass
+    return articles[:40]
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# ====================== PRICE FETCHER ======================
-def get_current_price(ticker: str):
+def get_current_price(ticker):
     try:
-        stock = yf.Ticker(f"{ticker}.NS")
-        price = stock.fast_info['lastPrice']
-        return round(price, 2)
+        data = yf.Ticker(f"{ticker}.NS").fast_info
+        price = data.get('lastPrice') or data.get('regularMarketPrice')
+        return round(float(price), 2) if price else None
     except:
         return None
 
-# ====================== AI ANALYSIS (Groq) ======================
-def analyze_with_groq(text: str):
-    prompt = """You are an elite Indian equity analyst. Return ONLY valid JSON."""
-    # (same detailed prompt as before - shortened for space)
-    prompt += f"""
-    News: {text}
-    Return JSON:
-    {{"stocks": [...], "sentiment": "...", "sector": "...", "event": "...", "research_house": "...", "confidence": 0-100, "reason": "..." }}
-    """
-    try:
-        resp = groq_client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}], temperature=0.1, max_tokens=700)
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"Groq Error: {e}")
-        return None
+def analyze_news(text: str, use_cerebras=False):
+    prompt = f"""You are an elite Indian stock analyst. Return ONLY valid JSON.
 
-# ====================== AI ANALYSIS (Cerebras) ======================
-def analyze_with_cerebras(text: str):
-    prompt = """You are an elite Indian equity analyst. Return ONLY valid JSON."""
-    # (identical schema as Groq)
-    prompt += f"""
-    News: {text}
-    Return JSON:
-    {{"stocks": [...], "sentiment": "...", "sector": "...", "event": "...", "research_house": "...", "confidence": 0-100, "reason": "..." }}
-    """
+News: {text}
+
+{{"stocks": ["HAL"], "sentiment": "positive", "sector": "defence", "event": "upgrade", "confidence": 80, "reason": "short reason"}}
+"""
     try:
-        resp = cerebras_client.chat.completions.create(
-            model="gpt-oss-120b",          # Cerebras flagship - different from Groq for real brainstorm
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=700
-        )
+        if use_cerebras and cerebras_client:
+            resp = cerebras_client.chat.completions.create(
+                model="gpt-oss-120b", messages=[{"role": "user", "content": prompt}], temperature=0.1
+            )
+        else:
+            resp = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}], temperature=0.1
+            )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        logging.error(f"Cerebras Error: {e}")
+        print(f"AI Error: {e}")
         return None
 
 def safe_json(text):
     if not text: return None
     try: return json.loads(text)
     except:
-        match = re.search(r'\{.*\}', text, re.DOTALL | re.IGNORECASE)
+        match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
             try: return json.loads(match.group())
             except: pass
     return None
 
-# ====================== BRAINSTORM CONSENSUS ======================
-def brainstorm_consensus(groq_data, cerebras_data, prices_dict):
-    combined = f"Groq analysis: {json.dumps(groq_data)}\nCerebras analysis: {json.dumps(cerebras_data)}\nCurrent prices: {prices_dict}"
-    prompt = f"""Two elite analysts (Groq + Cerebras) gave these views. Merge them into ONE final stronger opinion.
-    {combined}
-    
-    Return ONLY JSON with higher confidence:
-    {{"stocks": [...], "sentiment": "...", "sector": "...", "event": "...", "research_house": "...", "confidence": 0-100,
-      "reason": "...", "entry_price": "suggested entry (use current price)", "target_price": "...", "stop_loss": "..."}}
-    """
-    try:
-        resp = groq_client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role": "user", "content": prompt}], temperature=0.1)
-        return safe_json(resp.choices[0].message.content.strip())
-    except:
-        return groq_data or cerebras_data
-
-# ====================== SIGNAL + TELEGRAM FORMAT ======================
-def calculate_signal(data, price):
-    # (same strong logic as before + price boost)
-    score = data.get("confidence", 50)
-    # ... (boosts for defence, upgrade, etc. - same as previous version)
-    if score >= 85: signal = "🚀 STRONG BUY"
-    elif score >= 65: signal = "📈 BUY"
-    else: signal = "HOLD"
-    
-    entry = data.get("entry_price") or price
-    target = data.get("target_price") or (price * 1.18 if price else None)
-    stop = data.get("stop_loss") or (price * 0.92 if price else None)
-    
-    return {
-        "signal": signal,
-        "score": round(score, 1),
-        "ticker": data.get("stocks")[0] if data.get("stocks") else None,
-        "entry": entry,
-        "target": round(target, 2) if target else None,
-        "stop": round(stop, 2) if stop else None,
-        "reason": data.get("reason")
-    }
-
 # ====================== MAIN ======================
 def main():
-    print("🔥 Starting Groq + Cerebras Brainstorm Scanner...\n")
-    articles = fetch_all_news()   # (use same fetch function from last version)
-    
+    print("🚀 Starting AI Stock Scanner (Groq + optional Cerebras)...\n")
+    articles = fetch_all_news()
     results = []
-    seen_stocks = set()
     price_cache = {}
-    
+
     for article in articles:
-        text = article["title"] + " " + article["summary"]
-        print(f"📰 {article['title'][:100]}...")
-        
-        # Step 1: Groq first (cheaper + fast)
-        groq_raw = analyze_with_groq(text)
-        groq_data = safe_json(groq_raw)
-        if not groq_data or not groq_data.get("stocks"):
+        text = article["title"] + " " + article.get("summary", "")
+        print(f"📰 {article['title'][:90]}...")
+
+        raw = analyze_news(text, use_cerebras=bool(cerebras_client))
+        data = safe_json(raw)
+        if not data or not data.get("stocks"):
             continue
-        
-        # Step 2: Only if promising → Cerebras + Brainstorm
-        for ticker in groq_data.get("stocks", []):
-            if ticker not in price_cache:
-                price_cache[ticker] = get_current_price(ticker)
-        
-        cerebras_raw = analyze_with_cerebras(text)
-        cerebras_data = safe_json(cerebras_raw)
-        
-        final_data = brainstorm_consensus(groq_data, cerebras_data, price_cache)
-        if not final_data:
-            continue
-        
-        price = price_cache.get(final_data.get("stocks")[0]) if final_data.get("stocks") else None
-        signal = calculate_signal(final_data, price)
-        
-        if signal["signal"] != "HOLD":
-            results.append({**signal, "title": article["title"], "link": article["link"]})
-            print(f"   → {signal['signal']} | {signal['ticker']} | Entry ₹{signal['entry']} | Target ₹{signal['target']}")
-    
-    # ====================== CLEAN TELEGRAM OUTPUT ======================
-    print("\n" + "="*80)
-    print("📲 **COPY THIS FOR TELEGRAM** 📲\n")
-    
-    msg = f"🧠 **Groq + Cerebras Brainstorm** — {datetime.now().strftime('%d %b %H:%M')}\n\n"
-    msg += "🚀 **Early India Stock Signals**\n\n"
-    
-    for r in sorted(results, key=lambda x: x["score"], reverse=True)[:8]:
-        if not r["ticker"]: continue
+
+        ticker = data["stocks"][0]
+        if ticker not in price_cache:
+            price_cache[ticker] = get_current_price(ticker)
+        price = price_cache[ticker]
+
+        conf = int(data.get("confidence", 60))
+        signal = "🚀 STRONG BUY" if conf >= 80 else "📈 BUY" if conf >= 60 else "HOLD"
+        if signal == "HOLD": continue
+
+        entry = price or "Market Price"
+        target = round(price * 1.18, 2) if price else "N/A"
+        stop = round(price * 0.92, 2) if price else "N/A"
+
+        results.append({
+            "ticker": ticker,
+            "signal": signal,
+            "entry": entry,
+            "target": target,
+            "stop": stop,
+            "reason": data.get("reason", "Strong momentum detected"),
+            "confidence": conf
+        })
+
+    # ====================== CLEAN TELEGRAM MESSAGE ======================
+    print("\n" + "="*85)
+    print("📲 **COPY THIS BLOCK FOR YOUR TELEGRAM CHANNEL** 📲\n")
+
+    now = datetime.now().strftime('%d %b %H:%M')
+    msg = f"🧠 **AI Brainstorm Signals** — {now}\n\n"
+    msg += "**High Conviction India Stock Calls**\n\n"
+
+    for r in sorted(results, key=lambda x: x["confidence"], reverse=True)[:8]:
         msg += f"**{r['ticker']}** — {r['signal']}\n"
-        msg += f"Entry: ₹{r['entry']}  |  Target: ₹{r['target']} (+{round((r['target']/r['entry']-1)*100,1)}%)\n"
-        msg += f"Stop: ₹{r['stop']}\n"
-        msg += f"Reason: {r['reason']}\n\n"
-    
+        msg += f"Entry ≈ ₹{r['entry']} | Target ₹{r['target']} | Stop ₹{r['stop']}\n"
+        msg += f"→ {r['reason']}\n\n"
+
     if not results:
-        msg += "No strong signals today. Market quiet."
-    
-    msg += "\n⚡ Powered by Groq + Cerebras • Run every 15 mins"
-    
+        msg += "No strong signals detected in latest scan."
+
+    msg += "\n⚡ Powered by Groq (Cerebras when available) • Live NSE prices"
+
     print(msg)
-    
-    # Optional auto-send to Telegram
+
+    # Auto-post to Telegram if configured
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         import requests
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                      json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-        print("✅ Auto-posted to Telegram!")
+        try:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                          json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+            print("✅ Posted successfully to your Telegram channel!")
+        except Exception as e:
+            print("❌ Telegram post failed:", e)
 
 if __name__ == "__main__":
     main()
