@@ -11,7 +11,17 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Suppress yfinance noise
+# ====================== CONFIG CHECK ======================
+print("🔧 Configuration Check:")
+if not TELEGRAM_BOT_TOKEN:
+    print("❌ TELEGRAM_BOT_TOKEN is MISSING")
+if not TELEGRAM_CHAT_ID:
+    print("❌ TELEGRAM_CHAT_ID is MISSING")
+if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    print(f"✅ Secrets found → Will send to chat ID: {TELEGRAM_CHAT_ID}")
+print("=" * 70)
+
+# Suppress yfinance warnings
 yf.pdr_override = lambda *args, **kwargs: None
 
 RSS_FEEDS = [
@@ -42,7 +52,7 @@ def fetch_all_news():
 def clean_ticker(ticker: str):
     if not ticker: return None
     t = re.sub(r'[^A-Z0-9]', '', ticker.upper().strip())
-    if len(t) < 3 or t in ['NIFTY', 'SENSEX', 'CRUDEOIL', 'GOLD']:
+    if len(t) < 3 or t in ['NIFTY', 'SENSEX', 'CRUDEOIL', 'GOLD', 'BANKNIFTY']:
         return None
     return t
 
@@ -56,22 +66,24 @@ def get_current_price(ticker: str):
         return None
 
 def analyze_news(text: str):
-    prompt = f"""You are an elite Indian equity analyst. Return ONLY valid JSON.
+    prompt = f"""You are an elite Indian equity analyst focused on defence and momentum stocks.
+Return ONLY valid JSON.
 
 News: {text}
 
-JSON:
-{{"stocks": ["HAL"], "sentiment": "positive", "sector": "defence", "event": "upgrade", "confidence": 80, "reason": "short reason"}}
+JSON format:
+{{"stocks": ["HAL", "BEL"], "sentiment": "positive", "sector": "defence", "event": "upgrade", "confidence": 80, "reason": "short powerful reason"}}
 """
     try:
         resp = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=600
+            max_tokens=700
         )
         return resp.choices[0].message.content.strip()
-    except:
+    except Exception as e:
+        print(f"Groq Error: {e}")
         return None
 
 def safe_json(text):
@@ -93,6 +105,8 @@ def main():
 
     for article in articles:
         text = article["title"] + " " + article.get("summary", "")
+        print(f"📰 {article['title'][:90]}...")
+
         raw = analyze_news(text)
         data = safe_json(raw)
         if not data or not data.get("stocks"):
@@ -121,11 +135,11 @@ def main():
             "entry": entry,
             "target": target,
             "stop": stop,
-            "reason": data.get("reason", "Strong momentum detected"),
+            "reason": data.get("reason", "Strong momentum"),
             "confidence": conf
         })
 
-    # ====================== TELEGRAM OUTPUT ======================
+    # ====================== BUILD MESSAGE ======================
     now = datetime.now().strftime('%d %b %H:%M')
     msg = f"🧠 **AI Stock Signals** — {now}\n\n"
     msg += "**High Conviction Calls**\n\n"
@@ -143,11 +157,13 @@ def main():
         msg += f"→ {r['reason']}\n\n"
 
     if not seen:
-        msg += "No strong signals this run."
+        msg += "No strong signals this run.\n"
 
-    msg += "\n⚡ Powered by Groq • Live NSE prices"
+    msg += "⚡ Powered by Groq • Live NSE prices • Defence Focus"
 
+    print("\n" + "="*80)
     print(msg)
+    print("="*80)
 
     # ====================== SEND TO TELEGRAM ======================
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -164,9 +180,9 @@ def main():
                 print(f"❌ Telegram API Error: {response.status_code}")
                 print(response.text)
         except Exception as e:
-            print(f"❌ Failed to send message: {e}")
+            print(f"❌ Failed to send to Telegram: {e}")
     else:
-        print("⚠️ TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing in secrets")
+        print("⚠️ Cannot send - TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing in secrets")
 
 if __name__ == "__main__":
     main()
