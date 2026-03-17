@@ -1,0 +1,125 @@
+# AI News-Based Stock Analyst for Indian Markets
+# Uses Groq + Cerebras (free tiers) + News + NSE data
+
+import requests
+import feedparser
+import yfinance as yf
+from datetime import datetime
+
+# ================= CONFIG =================
+GROQ_API_KEY = "your_groq_api_key"
+CEREBRAS_API_KEY = "your_cerebras_api_key"
+
+TELEGRAM_TOKEN = "your_token"
+TELEGRAM_CHAT_ID = "your_chat_id"
+
+# Google News RSS for India markets
+RSS_FEEDS = [
+    "https://news.google.com/rss/search?q=indian+stock+market",
+    "https://news.google.com/rss/search?q=defence+india+stocks",
+    "https://news.google.com/rss/search?q=broker+upgrade+downgrade+india"
+]
+
+# ================= NEWS FETCH =================
+def fetch_news():
+    articles = []
+    for url in RSS_FEEDS:
+        feed = feedparser.parse(url)
+        for entry in feed.entries[:10]:
+            articles.append({
+                "title": entry.title,
+                "summary": entry.summary,
+                "link": entry.link
+            })
+    return articles
+
+# ================= GROQ CALL =================
+def analyze_with_groq(text):
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    prompt = f"""
+    Analyze this news and return JSON:
+    - sector
+    - sentiment (bullish/bearish/neutral)
+    - impacted_stocks (Indian stocks list)
+    - reasoning
+
+    News: {text}
+    """
+
+    data = {
+        "model": "llama3-70b-8192",
+        "messages": [{"role": "user", "content": prompt}]
+    }
+
+    res = requests.post(url, headers=headers, json=data)
+    return res.json()
+
+# ================= SCORING =================
+def score_signal(sentiment):
+    if sentiment == "bullish":
+        return 8
+    elif sentiment == "bearish":
+        return 3
+    return 5
+
+# ================= TELEGRAM =================
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+
+# ================= MAIN =================
+def main():
+    print("Scanning news...")
+    news = fetch_news()
+
+    results = []
+
+    for article in news:
+        text = article["title"] + " " + article["summary"]
+
+        try:
+            ai = analyze_with_groq(text)
+            content = ai["choices"][0]["message"]["content"]
+
+            score = score_signal("bullish")
+
+            results.append({
+                "news": article["title"],
+                "analysis": content,
+                "score": score
+            })
+        except Exception as e:
+            print("Error:", e)
+
+    # Sort by score
+    results = sorted(results, key=lambda x: x["score"], reverse=True)
+
+    # Send top 3
+    for r in results[:3]:
+        msg = f"🔥 {r['news']}\nScore: {r['score']}\n\n{r['analysis']}"
+        send_telegram(msg)
+
+if __name__ == "__main__":
+    main()
+
+# ================= REQUIREMENTS =================
+# requests
+# feedparser
+# yfinance
+
+# ================= HOW TO RUN =================
+# 1. Add API keys
+# 2. pip install -r requirements.txt
+# 3. python main.py
+
+# ================= NEXT IMPROVEMENTS =================
+# - Add Cerebras fallback
+# - Add analyst upgrade tracking
+# - Add NSE option chain signals
+# - Add scoring weights
+# - Add database (SQLite)
