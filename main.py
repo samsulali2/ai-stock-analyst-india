@@ -1,10 +1,8 @@
 import os
 import json
 import re
-import time
 from datetime import datetime
 import yfinance as yf
-import logging
 from groq import Groq
 
 # ========================= CONFIG =========================
@@ -13,9 +11,8 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Suppress yfinance spam
+# Suppress yfinance noise
 yf.pdr_override = lambda *args, **kwargs: None
-logging.getLogger("yfinance").setLevel(logging.ERROR)
 
 RSS_FEEDS = [
     "https://news.google.com/rss/search?q=india+stock+market+OR+defence+stocks+OR+broker+upgrade+OR+downgrade+OR+HAL+BEL+BDL",
@@ -42,11 +39,10 @@ def fetch_all_news():
             pass
     return articles
 
-def clean_ticker(ticker: str) -> str:
-    if not ticker:
-        return None
+def clean_ticker(ticker: str):
+    if not ticker: return None
     t = re.sub(r'[^A-Z0-9]', '', ticker.upper().strip())
-    if len(t) < 3 or t in ['NIFTY', 'SENSEX', 'CRUDEOIL', 'GOLD', 'BANKNIFTY']:
+    if len(t) < 3 or t in ['NIFTY', 'SENSEX', 'CRUDEOIL', 'GOLD']:
         return None
     return t
 
@@ -65,7 +61,7 @@ def analyze_news(text: str):
 News: {text}
 
 JSON:
-{{"stocks": ["HAL", "BEL"], "sentiment": "positive", "sector": "defence", "event": "upgrade", "confidence": 85, "reason": "short clear reason"}}
+{{"stocks": ["HAL"], "sentiment": "positive", "sector": "defence", "event": "upgrade", "confidence": 80, "reason": "short reason"}}
 """
     try:
         resp = groq_client.chat.completions.create(
@@ -75,8 +71,7 @@ JSON:
             max_tokens=600
         )
         return resp.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"Groq Error: {e}")
+    except:
         return None
 
 def safe_json(text):
@@ -91,26 +86,22 @@ def safe_json(text):
 
 # ====================== MAIN ======================
 def main():
-    print("🚀 Starting Clean Defence Stock Scanner...\n")
+    print("🚀 Starting AI Stock Signal Scanner...\n")
     articles = fetch_all_news()
     results = []
     price_cache = {}
 
     for article in articles:
         text = article["title"] + " " + article.get("summary", "")
-        print(f"📰 {article['title'][:95]}...")
-
         raw = analyze_news(text)
         data = safe_json(raw)
         if not data or not data.get("stocks"):
             continue
 
-        # Clean tickers
         clean_stocks = [clean_ticker(t) for t in data.get("stocks", []) if clean_ticker(t)]
         if not clean_stocks: continue
 
         ticker = clean_stocks[0]
-
         if ticker not in price_cache:
             price_cache[ticker] = get_current_price(ticker)
 
@@ -130,19 +121,15 @@ def main():
             "entry": entry,
             "target": target,
             "stop": stop,
-            "reason": data.get("reason", "Strong momentum"),
+            "reason": data.get("reason", "Strong momentum detected"),
             "confidence": conf
         })
 
-    # ====================== TELEGRAM MESSAGE ======================
-    print("\n" + "="*90)
-    print("📲 COPY THIS FOR YOUR TELEGRAM CHANNEL 📲\n")
-
+    # ====================== TELEGRAM OUTPUT ======================
     now = datetime.now().strftime('%d %b %H:%M')
-    msg = f"🧠 **AI Defence & Momentum Signals** — {now}\n\n"
+    msg = f"🧠 **AI Stock Signals** — {now}\n\n"
     msg += "**High Conviction Calls**\n\n"
 
-    # Remove duplicate tickers, keep highest confidence
     seen = {}
     for r in sorted(results, key=lambda x: x["confidence"], reverse=True):
         if r["ticker"] not in seen:
@@ -156,13 +143,13 @@ def main():
         msg += f"→ {r['reason']}\n\n"
 
     if not seen:
-        msg += "No strong signals in this scan."
+        msg += "No strong signals this run."
 
-    msg += "\n⚡ Powered by Groq • Live NSE prices • Defence focus"
+    msg += "\n⚡ Powered by Groq • Live NSE prices"
 
     print(msg)
 
-    # Auto post to Telegram
+    # ====================== SEND TO TELEGRAM ======================
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         import requests
         try:
@@ -172,13 +159,14 @@ def main():
                 timeout=10
             )
             if response.status_code == 200:
-                print("✅ Successfully posted to your Telegram channel!")
+                print("✅ Successfully sent to your bot chat!")
             else:
-                print(f"❌ Telegram failed: {response.text}")
+                print(f"❌ Telegram API Error: {response.status_code}")
+                print(response.text)
         except Exception as e:
-            print(f"❌ Telegram error: {e}")
+            print(f"❌ Failed to send message: {e}")
     else:
-        print("⚠️  Telegram not configured (add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets)")
+        print("⚠️ TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing in secrets")
 
 if __name__ == "__main__":
     main()
